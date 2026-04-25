@@ -1,0 +1,13 @@
+{
+  "projects": [
+    {
+      "id": "my-project",
+      "name": "My Project",
+      "path": ".",
+      "description": "Visible in the mobile project list.",
+      "defaultModel": "gpt-5.4",
+      "defaultSandbox": "workspace-write",
+      "defaultApprovalPolicy": "on-request"
+    }
+  ]
+}
