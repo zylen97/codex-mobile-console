@@ -44,7 +44,10 @@ export class DataStore {
 
   findSessionByThreadId(threadId?: string) {
     if (!threadId) return undefined;
-    return this.state.sessions.find((session) => session.codexThreadId === threadId);
+    return (
+      this.state.sessions.find((session) => session.id === threadId) ??
+      this.state.sessions.find((session) => session.codexThreadId === threadId)
+    );
   }
 
   createSession(input: Pick<ConsoleSession, "projectId" | "codexThreadId" | "title">) {
@@ -71,6 +74,18 @@ export class DataStore {
     return session;
   }
 
+  upsertSession(session: ConsoleSession) {
+    const existing = this.getSession(session.id);
+    if (existing) {
+      Object.assign(existing, session);
+      this.persist();
+      return existing;
+    }
+    this.state.sessions.push(session);
+    this.persist();
+    return session;
+  }
+
   listMessages(sessionId: string) {
     return this.state.messages
       .filter((message) => message.sessionId === sessionId)
@@ -80,7 +95,7 @@ export class DataStore {
   addMessage(input: Pick<ConsoleMessage, "sessionId" | "role" | "content"> & Partial<ConsoleMessage>) {
     const createdAt = now();
     const message: ConsoleMessage = {
-      id: nanoid(12),
+      id: input.id ?? nanoid(12),
       sessionId: input.sessionId,
       role: input.role,
       content: input.content,

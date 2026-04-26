@@ -19,6 +19,12 @@ export interface ConsoleSession {
   status: SessionStatus;
   activeTurnId?: string;
   lastError?: string;
+  preview?: string;
+  cwd?: string;
+  source?: string;
+  modelProvider?: string;
+  gitBranch?: string;
+  gitOrigin?: string;
   createdAt: string;
   updatedAt: string;
 }

@@ -30,7 +30,9 @@ export function toThreadStartParams(project: ProjectConfig, title?: string) {
     sandbox: project.defaultSandbox,
     personality: "friendly",
     serviceName: "codex_mobile_console",
-    developerInstructions: mobileConsoleInstructions(title)
+    developerInstructions: mobileConsoleInstructions(title),
+    experimentalRawEvents: false,
+    persistExtendedHistory: true
   };
 }
 
@@ -40,7 +42,7 @@ export function toTurnStartParams(project: ProjectConfig, threadId: string, text
     cwd: project.path,
     approvalPolicy: project.defaultApprovalPolicy,
     sandboxPolicy: sandboxPolicyFor(project.defaultSandbox, project.path),
-    input: [{ type: "text", text }]
+    input: [{ type: "text", text, text_elements: [] }]
   };
 }
 

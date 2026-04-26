@@ -1,19 +1,22 @@
 # Codex Mobile Console
 
-Android/iPad friendly remote console for controlling local Codex sessions on a Mac.
+Android/iPad friendly remote console for continuing local Codex sessions from a phone.
 
 ## What This Is
 
 This project runs a local Gateway on the Mac. The Gateway talks to `codex app-server` over stdio and exposes a narrow mobile API:
 
-- allowlisted projects from `config/projects.json`
-- multiple Codex sessions per project
+- real Codex threads from `thread/list`, grouped by their working directory
+- synced Codex session history from `thread/read`
+- session continuation through `thread/resume` and `turn/start`
 - live assistant streaming over WebSocket
 - mobile approval cards for command/file-change prompts
 - PWA UI that can be installed on Android Chrome or opened on iPad
 - Capacitor config for an Android wrapper
 
 The Gateway is intentionally separate from `codex app-server`. Do not expose `codex app-server` directly to the network.
+
+This is data-level sync, not desktop UI control. If you continue a session from Android, that same Codex thread is updated on disk and can be reopened from the desktop later. The desktop app does not need to jump focus to the same session.
 
 ## Install
 
@@ -77,9 +80,23 @@ Detach with `Ctrl-b d`, resume with:
 tmux attach -t codex-console
 ```
 
+## Session Sync Model
+
+The mobile app treats Codex as the source of truth:
+
+- `GET /api/projects` asks app-server for recent non-archived Codex threads.
+- Threads are grouped into projects by `cwd`.
+- `config/projects.json` is still useful for naming allowlisted roots and choosing default sandbox/approval settings for new or resumed turns.
+- Unknown `cwd` values are shown automatically as discovered projects.
+- The phone refreshes the project/session list and the selected session every 12 seconds.
+
+When you send a message from the phone, the Gateway resumes the existing Codex thread and appends a new turn. If a turn is started from the phone, its stream and approval prompts are shown live on the phone.
+
+If a different desktop Codex client is actively streaming in the same thread, the phone may not see every token live because that stream belongs to another client process. Refreshing the phone view reads the saved thread history after Codex writes it.
+
 ## Configure Projects
 
-By default the Gateway exposes this repository as one project. To add your own projects, create:
+By default the Gateway exposes this repository as one configured project. To add friendly names and default permissions for your own roots, create:
 
 ```text
 config/projects.json
@@ -104,7 +121,7 @@ Each project should use an absolute path for day-to-day use:
 }
 ```
 
-`config/projects.json` is gitignored because it usually contains local machine paths.
+`config/projects.json` is gitignored because it usually contains local machine paths. Sessions whose `cwd` is not listed here still appear; they use safe defaults unless they are inside one of your configured roots.
 
 Keep `defaultApprovalPolicy` as `on-request` for mobile control. Avoid `danger-full-access` unless you are sitting at the computer and know exactly why you need it.
 
@@ -167,7 +184,7 @@ Use it from GitHub:
 
 - The Gateway defaults to `127.0.0.1`; use `npm run dev:lan` only on a trusted private network or Tailscale.
 - Every API and WebSocket call requires the device token.
-- Projects are allowlisted. The phone cannot choose arbitrary folders.
+- The project list comes from saved Codex threads. New sessions should use configured project roots when you want explicit sandbox defaults.
 - Codex command and file-change approvals are routed back to the phone.
 - The mobile UI intentionally shows concise summaries. Do detailed diff review on the Mac before commits or pushes.
 

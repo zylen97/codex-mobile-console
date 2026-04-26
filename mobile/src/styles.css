@@ -215,6 +215,15 @@ button:disabled {
   font-size: 11px;
 }
 
+.session-row em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+}
+
 .session-row {
   grid-template-columns: auto minmax(0, 1fr);
 }

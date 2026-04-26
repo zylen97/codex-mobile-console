@@ -6,11 +6,20 @@ import websocketPlugin from "@fastify/websocket";
 import { z } from "zod";
 import { CodexAppServerClient, type JsonObject, type JsonRpcMessage, type JsonValue } from "./codex/CodexAppServerClient.js";
 import { threadIdFromParams, toThreadStartParams, toTurnStartParams, turnIdFromParams } from "./codex/helpers.js";
+import {
+  buildSyncedSnapshot,
+  mergeThreadMessages,
+  messagesFromThread,
+  projectByIdFromSnapshot,
+  projectForThread,
+  sessionFromThread,
+  type CodexThread
+} from "./codex/threadMapping.js";
 import { loadGatewayConfig } from "./config.js";
 import { mobileDistPath } from "./paths.js";
 import { getOrCreateDeviceToken, timingSafeEqualText } from "./security.js";
 import { DataStore } from "./state/store.js";
-import type { ApprovalDecision, GatewayEvent, ProjectConfig } from "./types.js";
+import type { ApprovalDecision, ConsoleSession, GatewayEvent, ProjectConfig } from "./types.js";
 
 const host = process.env.CMC_HOST ?? "127.0.0.1";
 const port = Number(process.env.CMC_PORT ?? 8787);
@@ -22,6 +31,8 @@ const codex = new CodexAppServerClient();
 const loadedThreads = new Set<string>();
 const clients = new Set<{ send: (message: string) => void }>();
 const itemCache = new Map<string, unknown>();
+const sessionCache = new Map<string, ConsoleSession>();
+let lastSyncedProjects: ProjectConfig[] = config.projects;
 
 const app = Fastify({ logger: true });
 
@@ -56,16 +67,14 @@ app.get("/api/status", async () => ({
   codexCli: "codex app-server via stdio"
 }));
 
-app.get("/api/projects", async () => ({
-  projects: config.projects,
-  sessions: store.listSessions()
-}));
+app.get("/api/projects", async () => buildSnapshot());
 
 app.get("/api/projects/:projectId/sessions", async (request, reply) => {
   const { projectId } = z.object({ projectId: z.string() }).parse(request.params);
-  const project = getProject(projectId);
+  const snapshot = await buildSnapshot();
+  const project = projectByIdFromSnapshot(snapshot.projects, projectId);
   if (!project) return reply.code(404).send({ error: "Unknown project" });
-  return { sessions: store.listSessions(projectId) };
+  return { sessions: snapshot.sessions.filter((session) => session.projectId === projectId) };
 });
 
 app.post("/api/projects/:projectId/sessions", async (request, reply) => {
@@ -75,23 +84,28 @@ app.post("/api/projects/:projectId/sessions", async (request, reply) => {
       title: z.string().min(1).max(120).optional()
     })
     .parse(request.body ?? {});
-  const project = getProject(params.projectId);
+  const snapshot = await buildSnapshot();
+  const project = projectByIdFromSnapshot(snapshot.projects, params.projectId);
   if (!project) return reply.code(404).send({ error: "Unknown project" });
 
   try {
     await codex.ensureReady();
     const result = (await codex.request("thread/start", toThreadStartParams(project, body.title) as never)) as {
-      thread?: { id?: string };
+      thread?: CodexThread;
     };
     const threadId = result.thread?.id;
     if (!threadId) throw new Error("Codex did not return a thread id");
+    if (body.title) {
+      await codex.request("thread/name/set", { threadId, name: body.title } as never);
+    }
 
     loadedThreads.add(threadId);
-    const session = store.createSession({
-      projectId: project.id,
-      codexThreadId: threadId,
-      title: body.title ?? `Mobile session ${new Date().toLocaleString()}`
-    });
+    const readResult = (await codex.request("thread/read", { threadId, includeTurns: false } as never)) as {
+      thread?: CodexThread;
+    };
+    const session = sessionFromThread(readResult.thread ?? { ...result.thread, id: threadId, cwd: project.path }, project);
+    store.upsertSession(session);
+    sessionCache.set(session.codexThreadId, session);
     broadcast({ type: "session.updated", data: session });
     return { session };
   } catch (error) {
@@ -101,60 +115,74 @@ app.post("/api/projects/:projectId/sessions", async (request, reply) => {
 
 app.get("/api/sessions/:sessionId", async (request, reply) => {
   const { sessionId } = z.object({ sessionId: z.string() }).parse(request.params);
-  const session = store.getSession(sessionId);
-  if (!session) return reply.code(404).send({ error: "Unknown session" });
-  return {
-    session,
-    messages: store.listMessages(sessionId),
-    approvals: store.listPendingApprovals().filter((approval) => approval.sessionId === sessionId)
-  };
+  try {
+    const { session, messages } = await readSyncedSession(sessionId, true);
+    return {
+      session,
+      messages,
+      approvals: store.listPendingApprovals().filter((approval) => approval.sessionId === sessionId)
+    };
+  } catch (error) {
+    return reply.code(404).send({ error: readableError(error) });
+  }
 });
 
 app.post("/api/sessions/:sessionId/messages", async (request, reply) => {
   const { sessionId } = z.object({ sessionId: z.string() }).parse(request.params);
   const body = z.object({ text: z.string().min(1).max(20_000) }).parse(request.body ?? {});
-  const session = store.getSession(sessionId);
-  if (!session) return reply.code(404).send({ error: "Unknown session" });
-  const project = getProject(session.projectId);
-  if (!project) return reply.code(404).send({ error: "Unknown project" });
-
-  const userMessage = store.addMessage({
-    sessionId,
-    role: "user",
-    content: body.text
-  });
-  broadcast({ type: "message.created", data: userMessage });
 
   try {
+    const { session, project } = await readSyncedSession(sessionId, false);
     await ensureThreadLoaded(session.codexThreadId, project);
 
+    let activeTurnId = session.activeTurnId;
     if (session.status === "running" && session.activeTurnId) {
-      await codex.request("turn/steer", {
+      const response = (await codex.request("turn/steer", {
         threadId: session.codexThreadId,
         expectedTurnId: session.activeTurnId,
-        input: [{ type: "text", text: body.text }]
-      } as never);
+        input: [{ type: "text", text: body.text, text_elements: [] }]
+      } as never)) as { turnId?: string };
+      activeTurnId = response.turnId ?? session.activeTurnId;
     } else {
       const response = (await codex.request(
         "turn/start",
         toTurnStartParams(project, session.codexThreadId, body.text) as never
       )) as { turn?: { id?: string } };
-      const activeTurnId = response.turn?.id;
-      const updated = store.updateSession(sessionId, {
-        status: "running",
-        activeTurnId,
-        lastError: undefined
-      });
-      if (updated) broadcast({ type: "session.updated", data: updated });
+      activeTurnId = response.turn?.id;
     }
+
+    const userMessage = store.addMessage({
+      id: `${session.id}:${activeTurnId ?? Date.now()}:local-user`,
+      sessionId,
+      role: "user",
+      content: body.text,
+      turnId: activeTurnId
+    });
+    broadcast({ type: "message.created", data: userMessage });
+
+    const updated = store.upsertSession({
+      ...session,
+      status: "running",
+      activeTurnId,
+      lastError: undefined,
+      updatedAt: new Date().toISOString()
+    });
+    sessionCache.set(updated.codexThreadId, updated);
+    broadcast({ type: "session.updated", data: updated });
 
     return { ok: true };
   } catch (error) {
-    const updated = store.updateSession(sessionId, {
-      status: "error",
-      lastError: readableError(error)
-    });
-    if (updated) broadcast({ type: "session.updated", data: updated });
+    const cached = store.getSession(sessionId);
+    if (cached) {
+      const updated = store.upsertSession({
+        ...cached,
+        status: "error",
+        lastError: readableError(error),
+        updatedAt: new Date().toISOString()
+      });
+      sessionCache.set(updated.codexThreadId, updated);
+      broadcast({ type: "session.updated", data: updated });
+    }
     return reply.code(500).send({ error: readableError(error) });
   }
 });
@@ -186,7 +214,10 @@ app.post("/api/approvals/:approvalId", async (request, reply) => {
       const session = store.getSession(approval.sessionId);
       if (session?.status === "waiting-approval") {
         const updatedSession = store.updateSession(session.id, { status: "running" });
-        if (updatedSession) broadcast({ type: "session.updated", data: updatedSession });
+        if (updatedSession) {
+          sessionCache.set(updatedSession.codexThreadId, updatedSession);
+          broadcast({ type: "session.updated", data: updatedSession });
+        }
       }
     }
 
@@ -205,7 +236,11 @@ app.get("/ws", { websocket: true }, (socket, request) => {
   }
 
   clients.add(socket);
-  socket.send(JSON.stringify(snapshotEvent()));
+  void buildSnapshot()
+    .then((snapshot) => socket.send(JSON.stringify({ type: "snapshot", data: snapshot } satisfies GatewayEvent)))
+    .catch((error) =>
+      socket.send(JSON.stringify({ type: "gateway.error", data: { error: readableError(error) } } satisfies GatewayEvent))
+    );
 
   socket.on("close", () => {
     clients.delete(socket);
@@ -231,8 +266,72 @@ app.log.info(`Local: http://127.0.0.1:${port}`);
 app.log.info(`Token: ${deviceToken}`);
 app.log.info(`For Tailscale/LAN access: CMC_HOST=0.0.0.0 npm run dev:gateway`);
 
-function getProject(projectId: string) {
-  return config.projects.find((project) => project.id === projectId);
+async function listCodexThreads() {
+  await codex.ensureReady();
+  const threads: CodexThread[] = [];
+  let cursor: string | null | undefined;
+  const maxThreads = Number(process.env.CMC_THREAD_LIMIT ?? 240);
+
+  do {
+    const result = (await codex.request(
+      "thread/list",
+      {
+        cursor: cursor ?? null,
+        limit: Math.min(100, maxThreads - threads.length),
+        sortKey: "updated_at",
+        sortDirection: "desc",
+        archived: false
+      } as never,
+      60_000
+    )) as { data?: CodexThread[]; nextCursor?: string | null };
+
+    threads.push(...(result.data ?? []));
+    cursor = result.nextCursor;
+  } while (cursor && threads.length < maxThreads);
+
+  return threads;
+}
+
+async function buildSnapshot() {
+  const threads = await listCodexThreads();
+  const { projects, sessions } = buildSyncedSnapshot(threads, config.projects);
+  lastSyncedProjects = projects;
+  for (const session of sessions) sessionCache.set(session.codexThreadId, session);
+  return {
+    projects,
+    sessions,
+    approvals: store.listPendingApprovals()
+  };
+}
+
+async function readSyncedSession(sessionId: string, includeTurns: boolean) {
+  await codex.ensureReady();
+  const result = (await codex.request(
+    "thread/read",
+    { threadId: sessionId, includeTurns } as never,
+    60_000
+  )) as { thread?: CodexThread };
+  if (!result.thread) throw new Error("Unknown session");
+
+  const project = projectForThread(result.thread, config.projects);
+  lastSyncedProjects = mergeProjects(lastSyncedProjects, [project]);
+  const session = sessionFromThread(result.thread, project);
+  const cached = store.findSessionByThreadId(session.codexThreadId) ?? sessionCache.get(session.codexThreadId);
+  const shouldKeepLocalActiveState =
+    Boolean(cached?.activeTurnId) &&
+    (cached?.status === "running" || cached?.status === "waiting-approval") &&
+    session.status === "idle";
+  const mergedSession = store.upsertSession({
+    ...session,
+    status: shouldKeepLocalActiveState ? cached!.status : session.status,
+    activeTurnId: shouldKeepLocalActiveState ? cached?.activeTurnId : undefined,
+    lastError: cached?.lastError
+  });
+  sessionCache.set(mergedSession.codexThreadId, mergedSession);
+
+  const history = includeTurns ? messagesFromThread(result.thread) : [];
+  const messages = includeTurns ? mergeThreadMessages(history, store.listMessages(session.id)) : [];
+  return { project, session: mergedSession, messages };
 }
 
 async function ensureThreadLoaded(threadId: string, project: ProjectConfig) {
@@ -243,15 +342,22 @@ async function ensureThreadLoaded(threadId: string, project: ProjectConfig) {
     cwd: project.path,
     approvalPolicy: project.defaultApprovalPolicy,
     sandbox: project.defaultSandbox,
-    personality: "friendly"
+    personality: "friendly",
+    persistExtendedHistory: true
   } as never);
   loadedThreads.add(threadId);
+}
+
+function mergeProjects(current: ProjectConfig[], incoming: ProjectConfig[]) {
+  const byId = new Map(current.map((project) => [project.id, project]));
+  for (const project of incoming) byId.set(project.id, project);
+  return Array.from(byId.values());
 }
 
 function handleCodexNotification(message: JsonRpcMessage) {
   const params = message.params ?? {};
   const threadId = threadIdFromParams(params);
-  const session = store.findSessionByThreadId(threadId);
+  const session = store.findSessionByThreadId(threadId) ?? (threadId ? sessionCache.get(threadId) : undefined);
 
   const item = params.item;
   if (item && typeof item === "object" && "id" in item && typeof item.id === "string") {
@@ -262,13 +368,38 @@ function handleCodexNotification(message: JsonRpcMessage) {
     }
   }
 
+  if (message.method === "thread/started" && threadId) {
+    void readSyncedSession(threadId, false)
+      .then(({ session: updatedSession }) => broadcast({ type: "session.updated", data: updatedSession }))
+      .catch((error) => broadcast({ type: "gateway.error", data: { error: readableError(error) } }));
+  }
+
+  if (message.method === "thread/name/updated" && threadId) {
+    const name = typeof params.threadName === "string" ? params.threadName : undefined;
+    const session = store.findSessionByThreadId(threadId);
+    if (session && name) {
+      const updated = store.upsertSession({ ...session, title: name, updatedAt: new Date().toISOString() });
+      sessionCache.set(updated.codexThreadId, updated);
+      broadcast({ type: "session.updated", data: updated });
+    }
+  }
+
+  if (message.method === "thread/status/changed" && threadId) {
+    void readSyncedSession(threadId, false)
+      .then(({ session: updatedSession }) => broadcast({ type: "session.updated", data: updatedSession }))
+      .catch(() => undefined);
+  }
+
   if (message.method === "turn/started" && session) {
     const updated = store.updateSession(session.id, {
       status: "running",
       activeTurnId: turnIdFromParams(params),
       lastError: undefined
     });
-    if (updated) broadcast({ type: "session.updated", data: updated });
+    if (updated) {
+      sessionCache.set(updated.codexThreadId, updated);
+      broadcast({ type: "session.updated", data: updated });
+    }
   }
 
   if (message.method === "item/agentMessage/delta" && session) {
@@ -296,16 +427,22 @@ function handleCodexNotification(message: JsonRpcMessage) {
       activeTurnId: undefined,
       lastError: error
     });
-    if (updated) broadcast({ type: "session.updated", data: updated });
+    if (updated) {
+      sessionCache.set(updated.codexThreadId, updated);
+      broadcast({ type: "session.updated", data: updated });
+    }
   }
 
   if (message.method === "item/started" && session) {
     const eventMessage = summarizeItemEvent("started", params);
     if (eventMessage) {
       const created = store.addMessage({
+        id: `${session.id}:${turnIdFromParams(params) ?? Date.now()}:${itemIdFromParams(params) ?? "event"}:started`,
         sessionId: session.id,
         role: "event",
-        content: eventMessage
+        content: eventMessage,
+        itemId: itemIdFromParams(params),
+        turnId: turnIdFromParams(params)
       });
       broadcast({ type: "message.created", data: created });
     }
@@ -315,9 +452,12 @@ function handleCodexNotification(message: JsonRpcMessage) {
     const eventMessage = summarizeItemEvent("completed", params);
     if (eventMessage) {
       const created = store.addMessage({
+        id: `${session.id}:${turnIdFromParams(params) ?? Date.now()}:${itemIdFromParams(params) ?? "event"}:completed`,
         sessionId: session.id,
         role: "event",
-        content: eventMessage
+        content: eventMessage,
+        itemId: itemIdFromParams(params),
+        turnId: turnIdFromParams(params)
       });
       broadcast({ type: "message.created", data: created });
     }
@@ -336,7 +476,7 @@ function handleCodexNotification(message: JsonRpcMessage) {
 function handleCodexServerRequest(message: JsonRpcMessage) {
   const params = message.params ?? {};
   const threadId = threadIdFromParams(params);
-  const session = store.findSessionByThreadId(threadId);
+  const session = store.findSessionByThreadId(threadId) ?? (threadId ? sessionCache.get(threadId) : undefined);
 
   if (message.id === undefined || !message.method) return;
 
@@ -365,7 +505,10 @@ function handleCodexServerRequest(message: JsonRpcMessage) {
 
   if (session) {
     const updated = store.updateSession(session.id, { status: "waiting-approval" });
-    if (updated) broadcast({ type: "session.updated", data: updated });
+    if (updated) {
+      sessionCache.set(updated.codexThreadId, updated);
+      broadcast({ type: "session.updated", data: updated });
+    }
   }
 
   broadcast({ type: "approval.created", data: approval });
@@ -388,6 +531,14 @@ function summarizeItemEvent(kind: "started" | "completed", params: Record<string
     return `File change ${status}`;
   }
 
+  return undefined;
+}
+
+function itemIdFromParams(params: Record<string, unknown> | undefined) {
+  if (!params) return undefined;
+  if (typeof params.itemId === "string") return params.itemId;
+  const item = params.item;
+  if (item && typeof item === "object" && "id" in item && typeof item.id === "string") return item.id;
   return undefined;
 }
 
@@ -430,17 +581,6 @@ function summarizeAnswers(answers?: Record<string, { answers: string[] }>) {
   return Object.entries(answers)
     .map(([key, value]) => `${key}: ${value.answers.join(", ")}`)
     .join("; ");
-}
-
-function snapshotEvent(): GatewayEvent {
-  return {
-    type: "snapshot",
-    data: {
-      projects: config.projects,
-      sessions: store.listSessions(),
-      approvals: store.listPendingApprovals()
-    }
-  };
 }
 
 function broadcast(event: GatewayEvent) {

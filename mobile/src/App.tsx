@@ -69,6 +69,15 @@ export function App() {
 
   useEffect(() => {
     if (!authorized) return;
+    const interval = window.setInterval(() => {
+      void refreshSnapshot();
+      if (selectedSessionRef.current) void loadSession(selectedSessionRef.current);
+    }, 12_000);
+    return () => window.clearInterval(interval);
+  }, [api, authorized]);
+
+  useEffect(() => {
+    if (!authorized) return;
 
     const ws = new WebSocket(api.websocketUrl());
     ws.onopen = () => setConnected(true);
@@ -98,13 +107,18 @@ export function App() {
       setSessions(payload.sessions);
       setApprovals(payload.approvals);
 
-      const projectId = selectedProjectId ?? payload.projects[0]?.id;
+      const projectId =
+        selectedProjectId && payload.projects.some((project) => project.id === selectedProjectId)
+          ? selectedProjectId
+          : payload.projects[0]?.id;
       if (projectId) setSelectedProjectId(projectId);
 
-      const firstSession =
-        selectedSessionId ??
-        payload.sessions.find((session) => session.projectId === projectId)?.id ??
-        payload.sessions[0]?.id;
+      const selectedStillExists = selectedSessionId
+        ? payload.sessions.some((session) => session.id === selectedSessionId)
+        : false;
+      const firstSession = selectedStillExists
+        ? selectedSessionId
+        : (payload.sessions.find((session) => session.projectId === projectId)?.id ?? payload.sessions[0]?.id);
       if (firstSession) setSelectedSessionId(firstSession);
     } catch (err) {
       setError(readableError(err));
@@ -275,7 +289,7 @@ export function App() {
 
       <main className="workspace">
         <aside className={`panel project-panel ${mobilePanel === "projects" ? "mobile-visible" : ""}`}>
-          <PanelTitle icon={<FolderGit2 size={17} />} title="Projects" />
+          <PanelTitle icon={<FolderGit2 size={17} />} title="Codex Projects" />
           <div className="project-list">
             {projects.map((project) => (
               <button
@@ -290,7 +304,7 @@ export function App() {
               >
                 <span>
                   <strong>{project.name}</strong>
-                  <small>{project.path}</small>
+                  <small>{projectSessionCount(sessions, project.id)} sessions · {project.path}</small>
                 </span>
                 <ChevronRight size={16} />
               </button>
@@ -301,7 +315,7 @@ export function App() {
             <input
               value={sessionTitle}
               onChange={(event) => setSessionTitle(event.target.value)}
-              placeholder="新 session 标题"
+              placeholder="新 Codex session 标题"
             />
             <button className="primary-button" onClick={() => void createSession()} disabled={!selectedProject}>
               <MessageSquarePlus size={16} />
@@ -309,7 +323,7 @@ export function App() {
             </button>
           </div>
 
-          <PanelTitle icon={<Activity size={17} />} title="Sessions" />
+          <PanelTitle icon={<Activity size={17} />} title="Synced Sessions" />
           <div className="session-list">
             {projectSessions.map((session) => (
               <button
@@ -323,7 +337,8 @@ export function App() {
                 <span className={`status-dot ${session.status}`} />
                 <span>
                   <strong>{session.title}</strong>
-                  <small>{session.status}</small>
+                  <small>{statusText(session.status)} · {formatDateTime(session.updatedAt)}</small>
+                  {session.preview && <em>{session.preview}</em>}
                 </span>
               </button>
             ))}
@@ -334,17 +349,23 @@ export function App() {
           <div className="chat-header">
             <div>
               <h1>{selectedSession?.title ?? "选择或新建一个 session"}</h1>
-              <p>{selectedProject?.name ?? "No project selected"}</p>
+              <p>
+                {selectedProject?.name ?? "No project selected"}
+                {selectedSession?.source ? ` · ${selectedSession.source}` : ""}
+                {selectedSession?.gitBranch ? ` · ${selectedSession.gitBranch}` : ""}
+              </p>
             </div>
-            <span className={`session-pill ${selectedSession?.status ?? "idle"}`}>{selectedSession?.status ?? "idle"}</span>
+            <span className={`session-pill ${selectedSession?.status ?? "idle"}`}>
+              {statusText(selectedSession?.status ?? "idle")}
+            </span>
           </div>
 
           <div className="message-list">
             {!selectedSession && (
               <div className="empty-state">
                 <Terminal size={28} />
-                <strong>先选一个项目，然后新建 session</strong>
-                <span>每个 session 会绑定一个 Codex thread，可以之后继续恢复。</span>
+                <strong>选择一个同步 session</strong>
+                <span>这里显示的是 Codex 已保存的真实 thread，手机和电脑会共享同一份进度。</span>
               </div>
             )}
 
@@ -614,6 +635,28 @@ function mergeApprovals(current: ApprovalRecord[], incoming: ApprovalRecord[]) {
   const byId = new Map(current.map((approval) => [approval.id, approval]));
   for (const approval of incoming) byId.set(approval.id, approval);
   return Array.from(byId.values()).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+function projectSessionCount(sessions: ConsoleSession[], projectId: string) {
+  return sessions.filter((session) => session.projectId === projectId).length;
+}
+
+function statusText(status: ConsoleSession["status"]) {
+  if (status === "running") return "运行中";
+  if (status === "waiting-approval") return "待审批";
+  if (status === "error") return "错误";
+  return "空闲";
+}
+
+function formatDateTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString([], {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
 }
 
 function readableError(error: unknown) {
