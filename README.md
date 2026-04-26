@@ -115,16 +115,53 @@ The fastest first version is the PWA:
 1. Open the UI in Android Chrome.
 2. Use Chrome menu -> Add to Home screen.
 
-For a native Android wrapper:
+For a native Android wrapper, install the local build tools first:
 
 ```bash
-npm run build
-npm run android:add
-npm run android:sync
-npm run android:open
+brew install openjdk@21
+brew install --cask android-commandlinetools
 ```
 
-Building an APK still needs Android Studio/SDK locally.
+Use the Homebrew JDK and Android SDK in the current shell:
+
+```bash
+export JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
+export ANDROID_SDK_ROOT=/opt/homebrew/share/android-commandlinetools
+export PATH="$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+```
+
+Accept Android SDK licenses and install the SDK packages used by the app:
+
+```bash
+yes | sdkmanager --licenses
+sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+```
+
+Build a debug APK:
+
+```bash
+npm run android:debug-apk
+```
+
+The generated APK is written to:
+
+```text
+android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+This is a debug APK for personal sideloading. A Play Store or public release build needs a release keystore and a separate signing step.
+
+## GitHub APK Build
+
+This repository includes a GitHub Actions workflow at `.github/workflows/android-debug-apk.yml`.
+
+Use it from GitHub:
+
+1. Open the repository Actions tab.
+2. Choose `Build Android Debug APK`.
+3. Click `Run workflow`.
+4. Download the `codex-console-debug-apk` artifact after the run completes.
 
 ## Safety Notes
 

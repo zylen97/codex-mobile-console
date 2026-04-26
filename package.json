@@ -15,7 +15,9 @@
     "build:mobile": "vite build --config mobile/vite.config.ts",
     "start": "node dist/server/index.js",
     "android:add": "cap add android",
-    "android:sync": "npm run build && cap sync android",
+    "android:prepare": "npm run build && if [ ! -d android ]; then cap add android; fi && cap sync android",
+    "android:sync": "npm run android:prepare",
+    "android:debug-apk": "npm run android:prepare && cd android && ./gradlew assembleDebug",
     "android:open": "cap open android",
     "check": "npm run build"
   },
